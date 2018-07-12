@@ -5,6 +5,7 @@
  * For the full copyright and license information, please view the LICENSE
  * file that was distributed with this source code.
  */
+use Doctrine\DBAL\Connection;
 use Shopware\Components\HttpClient\RequestException;
 use SwagPaymentPayPalUnified\Components\ErrorCodes;
 use SwagPaymentPayPalUnified\Components\ExceptionHandlerServiceInterface;
@@ -235,22 +236,18 @@ class Shopware_Controllers_Frontend_PaypalUnified extends \Shopware_Controllers_
             /** @var RelatedResource $responseSale */
             $responseSale = $response->getTransactions()->getRelatedResources()->getResources()[0];
 
-            // apply the payment status if its completed by PayPal
-            $paymentState = $responseSale->getState();
-            if ($paymentState === PaymentStatus::PAYMENT_COMPLETED &&
-                !$orderDataService->applyPaymentStatus($orderNumber, PaymentStatus::PAYMENT_STATUS_APPROVED)
-            ) {
-                $this->handleError(ErrorCodes::NO_ORDER_TO_PROCESS);
-
-                return;
-            }
-
             //Use TXN-ID instead of the PaymentId
             $saleId = $responseSale->getId();
             if (!$orderDataService->applyTransactionId($orderNumber, $saleId)) {
                 $this->handleError(ErrorCodes::NO_ORDER_TO_PROCESS);
 
                 return;
+            }
+
+            // apply the payment status if its completed by PayPal
+            $paymentState = $responseSale->getState();
+            if ($paymentState === PaymentStatus::PAYMENT_COMPLETED) {
+                $this->markOrderAsPayed($saleId, $paymentId);
             }
 
             // Save payment instructions from PayPal to database.
@@ -283,6 +280,30 @@ class Shopware_Controllers_Frontend_PaypalUnified extends \Shopware_Controllers_
         } catch (\Exception $exception) {
             $this->handleError(ErrorCodes::UNKNOWN, $exception);
         }
+    }
+
+    /**
+     * @param string $saleId
+     * @param string $paymentId
+     */
+    private function markOrderAsPayed($saleId, $paymentId)
+    {
+        $this->savePaymentStatus($saleId, $paymentId, PaymentStatus::PAYMENT_STATUS_APPROVED, false);
+
+        /** @var Connection $dbalConnection */
+        $dbalConnection = $this->get('dbal_connection');
+        $builder = $dbalConnection->createQueryBuilder();
+        $builder
+            ->update('s_order', 'o')
+            ->set('o.cleareddate', 'NOW()')
+            ->where('o.transactionID = :transactionId')
+            ->andWhere('o.temporaryID = :temporaryId')
+            ->setParameters([
+                ':transactionId' => $saleId,
+                ':temporaryId' => $paymentId,
+            ]);
+
+        $builder->execute();
     }
 
     /**
@@ -346,22 +367,29 @@ class Shopware_Controllers_Frontend_PaypalUnified extends \Shopware_Controllers_
         $message = null;
         $name = null;
 
-        if ($exception && $this->settingsService->hasSettings() && $this->settingsService->get('display_errors')) {
+        if ($exception) {
             /** @var ExceptionHandlerServiceInterface $exceptionHandler */
             $exceptionHandler = $this->get('paypal_unified.exception_handler_service');
-
             $error = $exceptionHandler->handle($exception, 'process checkout');
-            $message = $error->getMessage();
-            $name = $error->getName();
+
+            if ($this->settingsService->hasSettings() && $this->settingsService->get('display_errors')) {
+                $message = $error->getMessage();
+                $name = $error->getName();
+            }
         }
 
-        $this->redirect([
+        $redirectData = [
             'controller' => 'checkout',
             'action' => 'shippingPayment',
             'paypal_unified_error_code' => $code,
-            'paypal_unified_error_name' => $name,
-            'paypal_unified_error_message' => $message,
-        ]);
+        ];
+
+        if ($name !== null) {
+            $redirectData['paypal_unified_error_name'] = $name;
+            $redirectData['paypal_unified_error_message'] = $message;
+        }
+
+        $this->redirect($redirectData);
     }
 
     /**
